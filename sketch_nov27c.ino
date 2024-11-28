@@ -4,28 +4,25 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "DHT.h"
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // Definitions
 #define DHTTYPE DHT11
 #define DHTPIN 14  // GPIO14 (D5)
 #define DS18B20 2  // GPIO2 (D4)
 #define REPORTING_PERIOD_MS 1000
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1  // Reset pin (-1 if not used)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WiFi Credentials
-const char* ssid = "Abhijeet";       // Your WiFi SSID
-const char* password = "SRMVIT@1806"; // Your WiFi password
+const char* ssid = "Abhijeet";         // Your WiFi SSID
+const char* password = "SRMVIT@1806";  // Your WiFi password
 
 // Sensor Instances
 DHT dht(DHTPIN, DHTTYPE);
 PulseOximeter pox;
 OneWire oneWire(DS18B20);
 DallasTemperature sensors(&oneWire);
+Adafruit_MPU6050 mpu;
 
 // Web Server
 ESP8266WebServer server(80);
@@ -33,15 +30,19 @@ ESP8266WebServer server(80);
 // Global Variables
 float temperature = -1, humidity = -1, BPM = -1, SpO2 = -1, bodytemperature = -1;
 unsigned long lastDHTMillis = 0, lastDS18B20Millis = 0, lastMAXMillis = 0;
-const long DHTInterval = 2000;       // 2 seconds
-const long DS18B20Interval = 5000;   // 5 seconds
+const long DHTInterval = 2000;      // 2 seconds
+const long DS18B20Interval = 5000;  // 5 seconds
 uint32_t tsLastReport = 0;
 unsigned long lastTempReadMillis = 0;
+String posture = "Unknown";  // Default posture
+unsigned long lastMPUMillis = 0;
+const long MPUInterval = 1000; // 1 second interval for MPU6050 updates
+
 
 // Function Prototypes
 void handle_OnConnect();
 void handle_NotFound();
-String SendHTML(float temperature, float humidity, float BPM, float SpO2, float bodytemperature);
+String SendHTML(float temperature, float humidity, float BPM, float SpO2, float bodytemperature, String posture);
 
 // Setup Function
 void setup() {
@@ -68,21 +69,22 @@ void setup() {
   server.onNotFound(handle_NotFound);
   server.begin();
 
-  // Initialize the OLED with detected I2C address
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {  // 0x3C is the I2C address for the SSD1306
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);  // Don't proceed further if OLED fails to initialize
-  }
-  display.display();
-  delay(2000);  // Pause for 2 seconds to show the splash screen
-  display.clearDisplay();
-
   // MAX30100 Initialization
   Serial.print("Initializing MAX30100 sensor...");
   if (!pox.begin()) {
     Serial.println("FAILED to initialize MAX30100.");
   } else {
     Serial.println("SUCCESS");
+  }
+
+
+  // MPU6050 Initialization
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 Initialization Failed");
+    while (1)
+      ;
+  } else {
+    Serial.println("MPU6050 Initialized");
   }
 }
 
@@ -98,7 +100,7 @@ void loop() {
     BPM = pox.getHeartRate();
     SpO2 = pox.getSpO2();
     if (BPM == 0 || SpO2 == 0) {
-      
+
       BPM = -1;
       SpO2 = -1;
     }
@@ -116,11 +118,13 @@ void loop() {
   // DS18B20 Updates (asynchronous temperature conversion)
   if (currentMillis - lastDS18B20Millis >= DS18B20Interval) {
     lastDS18B20Millis = currentMillis;
+
     // Request temperature conversion asynchronously
     sensors.setWaitForConversion(false);
     sensors.requestTemperatures();
+
     // Schedule reading for after conversion time (750ms max for DS18B20)
-    if (currentMillis - lastTempReadMillis >= 750) { // Wait for conversion
+    if (currentMillis - lastTempReadMillis >= 750) {  // Wait for conversion
       lastTempReadMillis = currentMillis;
       float temp = sensors.getTempCByIndex(0);
       if (temp == DEVICE_DISCONNECTED_C) {
@@ -132,26 +136,24 @@ void loop() {
     }
   }
 
-  // Display on OLED
-  display.clearDisplay();
-  display.setTextSize(1);  // Text size
-  display.setTextColor(SSD1306_WHITE);  // Text color
-  display.setCursor(0, 0);  // Start at top-left corner
-  display.print("Heart Rate: ");
-  display.print((BPM == -1) ? "--" : String(BPM));
-  display.println(" BPM");
+// MPU6050 Updates (every 1 second)
+  if (currentMillis - lastMPUMillis >= MPUInterval) {
+    lastMPUMillis = currentMillis;
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-  display.print("SpO2: ");
-  display.print((SpO2 == -1) ? "--" : String(SpO2));
-  display.println(" %");
+    // Posture Detection
+    if (a.acceleration.z > 9) {
+      posture = "Lying Down";
+    } else if (a.acceleration.y > 9) {
+      posture = "Sitting";
+    } else if (a.acceleration.x > 9) {
+      posture = "Standing";
+    } else {
+      posture = "Moving";
+    }
+  }
 
-  display.print("Body Temp: ");
-  display.print((bodytemperature == -1) ? "--" : String(bodytemperature, 1));
-  display.println(" C");
-
-  display.display();
-
-  delay(1000);  // Update every second (you can change this as needed)
 
   // Debugging Outputs
   if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
@@ -167,19 +169,24 @@ void loop() {
     Serial.println((SpO2 == -1) ? "N/A" : String(SpO2) + " %");
     Serial.print("Body Temperature: ");
     Serial.println((bodytemperature == -1) ? "N/A" : String(bodytemperature) + " °C");
+    Serial.print("Posture: ");
+    Serial.println(posture);
     Serial.println("*********************************");
   }
 }
 
+
+// Web Server Handlers
 void handle_OnConnect() {
-  server.send(200, "text/html", SendHTML(temperature, humidity, BPM, SpO2, bodytemperature));
+  server.send(200, "text/html", SendHTML(temperature, humidity, BPM, SpO2, bodytemperature, posture));
 }
 
 void handle_NotFound() {
   server.send(404, "text/plain", "Not found");
 }
 
-String SendHTML(float temperature, float humidity, float BPM, float SpO2, float bodytemperature) {
+// HTML Page
+String SendHTML(float temperature, float humidity, float BPM, float SpO2, float bodytemperature, String posture) {
   String html = "<!DOCTYPE html>";
   html += "<html>";
   html += "<head>";
@@ -264,12 +271,27 @@ html += "</script>";
   html += "</div>";
 
   
-  // Sleep Hours
-  html += "<div class='card'>";
-  html += "<div class='icon'><i class='fas fa-bed'></i></div>";
-  html += "<div class='value'>12 hrs</div>";
-  html += "<div class='label'>Sleep</div>";
-  html += "</div>";
+String postureIcon;
+
+// Dynamically set the icon based on posture
+if (posture == "Lying Down") {
+  postureIcon = "fas fa-bed";
+} else if (posture == "Moving") {
+  postureIcon = "fas fa-walking";
+} else if (posture == "Sitting") {
+  postureIcon = "fas fa-chair";
+} else if (posture == "Standing") {
+  postureIcon = "fas fa-male"; // Or "fas fa-person"
+} else {
+  postureIcon = "fas fa-question-circle"; // Default icon for unknown postures
+}
+
+// Update the HTML for the card
+html += "<div class='card'>";
+html += "<div class='icon'><i class='" + postureIcon + "'></i></div>";
+html += "<p>Posture: " + posture + "</p>";
+html += "<div class='label'>Posture</div>";
+html += "</div>";
 
   html += "</div>"; // End of Row
 
